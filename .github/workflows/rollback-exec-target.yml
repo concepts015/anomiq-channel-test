@@ -1,0 +1,250 @@
+name: rollback exec-target (AnomIQ reference)
+
+# The pipeline a customer owns when AnomIQ carries out an approved ECS rollback through GitHub Actions
+# (ADR-019 2.4, 3.4, 7.2 proof B). AnomIQ starts it with workflow_dispatch at the protected tag
+# `channel-rollback-v1` and finds the run by its name. The run name carries the step key and the dispatch
+# hash, which is how AnomIQ reads the echo back.
+#
+#   job 1 (gate)      asks AnomIQ's start gate whether this run may act, with this workflow's own OIDC token;
+#                     it stops unless the answer is `active`, and passes the signed answer on
+#   job 2 (rollback)  assumes the customer's IAM role by OIDC and starts SSM Automation
+#                     AnomIQ-ECS-Service-Rollback with ClientToken = the vendor token (one effect however
+#                     often this runs)
+#
+# Rules this file keeps: manual trigger only (so a pull request from a fork can never reach the runner);
+# the operator's own self-hosted runner, label anomiq-channel-test, never a GitHub-hosted one (the owner's rule); no
+# `environment:` key (ADR-005); every third-party action pinned by full commit SHA;
+# the least `permissions`; no input is ever placed inside a script (inputs reach scripts only as environment
+# variables, after they are checked against a pattern). The reserved anomiq_* inputs are the envelope of
+# docs/v2/servicenow/CHANNEL_FLOW_SPEC.md.
+#
+# TEST variants. The repository variables ANOMIQ_FAULT_MODE (none, skip_gate, never_start,
+# report_success_without_acting, act_then_report_failure, never_finish) and ANOMIQ_FAULT_DELAY (seconds, 0 to
+# 120) let the acceptance harness make this customer pipeline misbehave on purpose in the TEST repository.
+# They are variables, not inputs: AnomIQ's dispatch cannot set them, and a repository that never sets them
+# runs the honest pipeline. A customer's real workflow has no such step.
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables; none is a secret):
+#   ANOMIQ_GATE_AUDIENCE     the audience AnomIQ's gate expects in the OIDC token
+#   ANOMIQ_GATE_BASE_URL     https://<api>/v1/channels/attempts/   (the gate URL input must equal this
+#                            plus the attempt id plus /gate, so a dispatcher cannot redirect the token)
+#   ANOMIQ_CHANNEL_ROLE_ARN  output ChannelRollbackRoleArn of the customer stack
+#   ANOMIQ_AWS_REGION        the region of the customer stack (for example us-east-1)
+
+run-name: anomiq ${{ inputs.anomiq_step_key }} ${{ inputs.anomiq_dispatch_hash }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: ECS cluster of the service
+        type: string
+        required: true
+      service:
+        description: ECS service to roll back
+        type: string
+        required: true
+      expected_current:
+        description: Task definition the service runs now (checked by AnomIQ before and after)
+        type: string
+        required: true
+      target_revision:
+        description: Task definition to roll back to
+        type: string
+        required: true
+      anomiq_attempt_id:
+        description: Reserved by AnomIQ, attempt id
+        type: string
+        required: true
+      anomiq_step_key:
+        description: Reserved by AnomIQ, step key (names the run)
+        type: string
+        required: true
+      anomiq_vendor_token:
+        description: Reserved by AnomIQ, idempotency token for the effect (a UUID)
+        type: string
+        required: true
+      anomiq_plan_hash:
+        description: Reserved by AnomIQ, hash of the approved plan
+        type: string
+        required: true
+      anomiq_authorization_id:
+        description: Reserved by AnomIQ, authorization id
+        type: string
+        required: true
+      anomiq_dispatch_hash:
+        description: Reserved by AnomIQ, hash of this dispatch (echoed in the run name)
+        type: string
+        required: true
+      anomiq_gate_url:
+        description: Reserved by AnomIQ, URL of the start gate for this attempt
+        type: string
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: anomiq-${{ inputs.anomiq_attempt_id }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: ask AnomIQ whether this run may act
+    runs-on: [self-hosted, linux, x64, anomiq-channel-test]
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    outputs:
+      signature: ${{ steps.gate.outputs.signature }}
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      SERVICE: ${{ inputs.service }}
+      EXPECTED_CURRENT: ${{ inputs.expected_current }}
+      TARGET_REVISION: ${{ inputs.target_revision }}
+      ATTEMPT_ID: ${{ inputs.anomiq_attempt_id }}
+      STEP_KEY: ${{ inputs.anomiq_step_key }}
+      VENDOR_TOKEN: ${{ inputs.anomiq_vendor_token }}
+      PLAN_HASH: ${{ inputs.anomiq_plan_hash }}
+      AUTHORIZATION_ID: ${{ inputs.anomiq_authorization_id }}
+      DISPATCH_HASH: ${{ inputs.anomiq_dispatch_hash }}
+      GATE_URL: ${{ inputs.anomiq_gate_url }}
+      GATE_BASE_URL: ${{ vars.ANOMIQ_GATE_BASE_URL }}
+      GATE_AUDIENCE: ${{ vars.ANOMIQ_GATE_AUDIENCE }}
+      FAULT_MODE: ${{ vars.ANOMIQ_FAULT_MODE }}
+      FAULT_DELAY: ${{ vars.ANOMIQ_FAULT_DELAY }}
+    steps:
+      - name: Test delay before the gate (TEST repository only)
+        run: |
+          set -euo pipefail
+          delay="${FAULT_DELAY:-0}"
+          [[ "$delay" =~ ^[0-9]{1,3}$ && "$delay" -le 120 ]] || delay=0
+          sleep "$delay"
+
+      - name: Check the inputs
+        id: check
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          td='^(arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/)?[A-Za-z0-9_-]{1,255}:[0-9]{1,6}$'
+          ident='^[A-Za-z0-9_.:-]{1,128}$'
+          [[ "$GATE_BASE_URL" =~ ^https://[A-Za-z0-9._~:/-]+/$ ]] || fail "repository variable ANOMIQ_GATE_BASE_URL is missing or not an https URL ending in /"
+          [[ "$GATE_AUDIENCE" =~ ^[A-Za-z0-9._~:/-]{1,256}$ ]] || fail "repository variable ANOMIQ_GATE_AUDIENCE is missing or malformed"
+          [[ "$CLUSTER" =~ ^[A-Za-z0-9_-]{1,255}$ ]] || fail "cluster is not an ECS cluster name"
+          [[ "$SERVICE" =~ ^[A-Za-z0-9_-]{1,255}$ ]] || fail "service is not an ECS service name"
+          [[ "$EXPECTED_CURRENT" =~ $td ]] || fail "expected_current is not a task definition"
+          [[ "$TARGET_REVISION" =~ $td ]] || fail "target_revision is not a task definition"
+          [[ "$VENDOR_TOKEN" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || fail "anomiq_vendor_token is not a UUID"
+          for pair in "attempt id:$ATTEMPT_ID" "step key:$STEP_KEY" "plan hash:$PLAN_HASH" "authorization id:$AUTHORIZATION_ID" "dispatch hash:$DISPATCH_HASH"; do
+            [[ "${pair#*:}" =~ $ident ]] || fail "${pair%%:*} is malformed"
+          done
+          [[ "$GATE_URL" == "${GATE_BASE_URL}${ATTEMPT_ID}/gate" ]] || fail "anomiq_gate_url is not the gate URL of this attempt under ANOMIQ_GATE_BASE_URL"
+
+      - name: Ask the start gate
+        id: gate
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          if [[ "${FAULT_MODE:-none}" == skip_gate ]]; then
+            # TEST variant: the customer's automation does not call the start gate (an Ungated binding)
+            echo "signature=ungated-test-variant" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          work="$(mktemp -d)"
+          audience="$(jq -rn --arg a "$GATE_AUDIENCE" '$a|@uri')"
+          curl -sS --fail-with-body --max-time 20 \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            -o "$work/oidc.json" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${audience}" \
+            || fail "could not get this workflow's identity token"
+          jwt="$(jq -er '.value' "$work/oidc.json")"
+          echo "::add-mask::${jwt}"
+          body="$(jq -cn --arg d "$DISPATCH_HASH" --arg r "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" '{dispatch_hash: $d, run_ref: $r}')"
+          code="$(curl -sS --max-time 20 -o "$work/gate.json" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${jwt}" -H 'Content-Type: application/json' \
+            --data "$body" "$GATE_URL")" || code=000
+          # The gate discloses nothing but its answer; neither is the body printed when it refuses.
+          [[ "$code" == 200 ]] || fail "gate_refused:${code}"
+          [[ "$(jq -r '.status // empty' "$work/gate.json")" == active ]] || fail "gate_refused:not_active"
+          signature="$(jq -r '.signature // empty' "$work/gate.json")"
+          [[ "$signature" =~ ^[A-Za-z0-9._~+/=-]{8,2048}$ ]] || fail "gate_refused:no_signature"
+          echo "signature=${signature}" >> "$GITHUB_OUTPUT"
+          echo "The gate answered active for attempt ${ATTEMPT_ID}."
+
+  rollback:
+    name: start the pinned rollback automation
+    needs: gate
+    runs-on: [self-hosted, linux, x64, anomiq-channel-test]
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+    outputs:
+      automation_execution_id: ${{ steps.start.outputs.automation_execution_id }}
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      SERVICE: ${{ inputs.service }}
+      TARGET_REVISION: ${{ inputs.target_revision }}
+      VENDOR_TOKEN: ${{ inputs.anomiq_vendor_token }}
+      DISPATCH_HASH: ${{ inputs.anomiq_dispatch_hash }}
+      GATE_SIGNATURE: ${{ needs.gate.outputs.signature }}
+      CHANNEL_ROLE_ARN: ${{ vars.ANOMIQ_CHANNEL_ROLE_ARN }}
+      AWS_REGION_NAME: ${{ vars.ANOMIQ_AWS_REGION }}
+      FAULT_MODE: ${{ vars.ANOMIQ_FAULT_MODE }}
+    steps:
+      - name: Test variants (TEST repository only)
+        run: |
+          set -euo pipefail
+          mode="${FAULT_MODE:-none}"
+          case "$mode" in
+            none|skip_gate|report_success_without_acting|act_then_report_failure) ;;
+            never_start) echo "::error::test variant never_start"; exit 1 ;;
+            never_finish) sleep 120; echo "::error::test variant never_finish"; exit 1 ;;
+            *) echo "::error::unknown test variant"; exit 1 ;;
+          esac
+
+      - name: Check what this job uses
+        id: check
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          td='^(arn:aws:ecs:[a-z0-9-]+:[0-9]{12}:task-definition/)?[A-Za-z0-9_-]{1,255}:[0-9]{1,6}$'
+          [[ -n "$GATE_SIGNATURE" ]] || fail "the gate did not pass its answer on"
+          [[ "$CHANNEL_ROLE_ARN" =~ ^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,128}$ ]] || fail "repository variable ANOMIQ_CHANNEL_ROLE_ARN is missing or malformed"
+          [[ "$AWS_REGION_NAME" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || fail "repository variable ANOMIQ_AWS_REGION is missing or malformed"
+          [[ "$CLUSTER" =~ ^[A-Za-z0-9_-]{1,255}$ ]] || fail "cluster is not an ECS cluster name"
+          [[ "$SERVICE" =~ ^[A-Za-z0-9_-]{1,255}$ ]] || fail "service is not an ECS service name"
+          [[ "$TARGET_REVISION" =~ $td ]] || fail "target_revision is not a task definition"
+          [[ "$VENDOR_TOKEN" =~ ^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$ ]] || fail "anomiq_vendor_token is not a UUID"
+
+      - name: Assume the customer's rollback role by OIDC
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.ANOMIQ_CHANNEL_ROLE_ARN }}
+          aws-region: ${{ vars.ANOMIQ_AWS_REGION }}
+          role-session-name: anomiq-channel-rollback
+          role-duration-seconds: 900
+
+      - name: Start AnomIQ-ECS-Service-Rollback with the vendor token
+        id: start
+        run: |
+          set -euo pipefail
+          if [[ "${FAULT_MODE:-none}" == report_success_without_acting ]]; then
+            # TEST variant: the run reports success and does nothing
+            echo "automation_execution_id=fault-no-effect" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          parameters="$(jq -cn --arg c "$CLUSTER" --arg s "$SERVICE" --arg t "$TARGET_REVISION" \
+            '{Cluster: [$c], Service: [$s], TaskDefinition: [$t]}')"
+          id="$(aws ssm start-automation-execution \
+            --document-name AnomIQ-ECS-Service-Rollback --document-version 1 \
+            --parameters "$parameters" --client-token "$VENDOR_TOKEN" \
+            --query AutomationExecutionId --output text)"
+          [[ "$id" =~ ^[0-9a-fA-F-]{8,64}$ ]] || { echo "::error::unexpected automation execution id"; exit 1; }
+          echo "automation_execution_id=${id}" >> "$GITHUB_OUTPUT"
+          if [[ "${FAULT_MODE:-none}" == act_then_report_failure ]]; then
+            echo "::error::test variant act_then_report_failure"; exit 1
+          fi
+          {
+            echo "### AnomIQ rollback started"
+            echo "- automation execution: \`${id}\`"
+            echo "- dispatch hash: \`${DISPATCH_HASH}\`"
+            echo "- gate answer: active (signature \`${GATE_SIGNATURE}\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
