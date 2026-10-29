@@ -248,3 +248,5 @@ jobs:
             echo "- dispatch hash: \`${DISPATCH_HASH}\`"
             echo "- gate answer: active (signature \`${GATE_SIGNATURE}\`)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+# alt: a second version of this file, for the stage that moves the pin (not for use)
