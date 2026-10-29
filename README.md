@@ -11,8 +11,8 @@ by OIDC and starts the SSM Automation document `AnomIQ-ECS-Service-Rollback` wit
 `ClientToken`, so the effect happens once however often the run is repeated. The run is named
 `anomiq <step key> <dispatch hash>`; AnomIQ finds the run by that name and reads the hash back.
 
-**What it deliberately is not.** No other trigger. No `environment:`. No self-hosted runner (the
-repository is public). No third-party action that is not pinned by full commit SHA. No input is ever
+**What it deliberately is not.** No other trigger. No `environment:`. Every job runs on the operator's own self-hosted runner (label `anomiq-channel-test`), never on a GitHub-hosted one;
+the only trigger is `workflow_dispatch`, so a pull request from a fork cannot start a job on it. No third-party action that is not pinned by full commit SHA. No input is ever
 placed inside a script: inputs reach scripts only as environment variables, after they are checked
 against a pattern.
 

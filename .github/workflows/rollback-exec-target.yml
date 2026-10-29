@@ -11,8 +11,9 @@ name: rollback exec-target (AnomIQ reference)
 #                     AnomIQ-ECS-Service-Rollback with ClientToken = the vendor token (one effect however
 #                     often this runs)
 #
-# Rules this file keeps: manual trigger only; GitHub-hosted runner (this repository is public, so never a
-# self-hosted one); no `environment:` key (ADR-005); every third-party action pinned by full commit SHA;
+# Rules this file keeps: manual trigger only (so a pull request from a fork can never reach the runner);
+# the operator's own self-hosted runner, label anomiq-channel-test, never a GitHub-hosted one (the owner's rule); no
+# `environment:` key (ADR-005); every third-party action pinned by full commit SHA;
 # the least `permissions`; no input is ever placed inside a script (inputs reach scripts only as environment
 # variables, after they are checked against a pattern). The reserved anomiq_* inputs are the envelope of
 # docs/v2/servicenow/CHANNEL_FLOW_SPEC.md.
@@ -89,7 +90,7 @@ concurrency:
 jobs:
   gate:
     name: ask AnomIQ whether this run may act
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, anomiq-channel-test]
     timeout-minutes: 5
     permissions:
       id-token: write
@@ -171,7 +172,7 @@ jobs:
   rollback:
     name: start the pinned rollback automation
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, anomiq-channel-test]
     timeout-minutes: 10
     permissions:
       id-token: write
